@@ -27,30 +27,44 @@ import atexit
 import requests
 import subprocess
 import time
+import logging
+import hashlib
 
 # You need to set specific IXP Manager installation details
 # You should only need to edit the first 3 lines
-
-api_key = "your-api-key"
-url_root = "https://ixp.example.com"
-bird_bin = "/usr/sbin/bird"
+API_KEY = "your-api-key"
+URL_ROOT = "https://ixp.example.com"
+BIRD_BIN = "/usr/sbin/bird"
 
 # Following code should be fine on a typical Debian/Ubuntu system
-url_lock = f"{url_root}/api/v4/router/get-update-lock"
-url_conf = f"{url_root}/api/v4/router/gen-config"
-url_done = f"{url_root}/api/v4/router/updated"
+URL_LOCK = f"{URL_ROOT}/api/v4/router/get-update-lock"
+URL_CONF = f"{URL_ROOT}/api/v4/router/gen-config"
+URL_DONE = f"{URL_ROOT}/api/v4/router/updated"
 
-etc_path = "/usr/local/etc/bird"
-run_path = "/var/run/bird"
-log_path = "/var/log/bird"
-lock_path = "/tmp/ixp-manager-locks"
+ETC_PATH = "/usr/local/etc/bird"
+RUN_PATH = "/var/run/bird"
+LOG_PATH = "/var/log/bird"
+LOCK_PATH = "/tmp/ixp-manager-locks"
+
+SLACK_URL = (
+    "https://hooks.slack.com/services/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"
+)
 
 
-# Parse command line arguments and set necessary variables
+# Exit with an error code and send the error to Slack
+def error_exit(code, error, logger, handle):
+    logger.error(f"Message - {error}")
+    host = os.gethostname()
+    if SLACK_URL:
+        requests.post(
+            SLACK_URL,
+            json={
+                "text": f"host: {host}, handle: {handle}, error: {error}, code: {code}",
+            },
+        )
 
-# Set as normal variables for now but should be changed to env variables later
-debug = 0
-force_reload = 0
+    sys.exit(code)
+
 
 # Parse command line arguments
 def parse_args():
@@ -58,206 +72,272 @@ def parse_args():
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug mode")
     parser.add_argument("-f", "--force", action="store_true", help="Force reload")
     parser.add_argument("-H", "--handle", type=str, help="Router handle")
-    
+
     args = parser.parse_args()
     return args
 
-# Check if the script is run with any arguments
-args = parse_args()
-if args.debug:
-	debug = 1
-if args.force:
-    force_reload = 1
-if args.handle:
-	handle = args.handle
-else:
-    print("ERROR: handle is required")
-    sys.exit(1)
 
 # Create necessary directories for Bird
-try:
-	os.makedirs(etc_path, exist_ok=True)
-	os.makedirs(log_path, exist_ok=True)
-	os.makedirs(run_path, exist_ok=True)
-	os.makedirs(lock_path, exist_ok=True)
-except:
-    print("ERROR: could not create directories most likely due to permissions")
-    sys.exit()
+def create_directories(logger):
+    try:
+        os.makedirs(ETC_PATH, exist_ok=True)
+        os.makedirs(LOG_PATH, exist_ok=True)
+        os.makedirs(RUN_PATH, exist_ok=True)
+        os.makedirs(LOCK_PATH, exist_ok=True)
+    except OSError as e:
+        logger.error("Could not create directories most likely due to permissions")
+        logger.error(f"Message - {e}")
+        sys.exit()
 
-cfile = f"{etc_path}/bird-{handle}.conf"
-dest = f"{cfile}.$$"
-socket = f"{run_path}/bird-{handle}.ctl"
 
 # Only allow one instance of the script to run at a time - script locking
-lock = f"{lock_path}/{handle}.lock"
-
-def remove_lock():
+def remove_lock(lock):
     if os.path.exists(lock):
         os.remove(lock)
 
-def create_lock():
+
+def create_lock(lock, handle, logger):
     if os.path.exists(lock):
-        print(f"There is another instance running for {handle} and locked via {lock}, exiting")
+        logger.info(
+            f"There is another instance running for {handle} and locked via {lock}, exiting"
+        )
         sys.exit(1)
     else:
         process_id = os.getpid()
         with open(lock, "w") as file:
             file.write(str(process_id))
-        atexit.register(remove_lock)
-        
-create_lock()
+        atexit.register(remove_lock(lock))
+
 
 # Get a lock from IXP Manager to update the router
-headers = {"X-IXP-Manager-API-Key": api_key}
+def get_lock(handle, headers, debug, logger):
+    if debug:
+        logger.debug(f"POST {URL_LOCK}/{handle} with API key {API_KEY}")
 
-if debug:
-    print(f"POST {url_lock}/{handle} with API key {api_key}")
-    
-try:
-    response = requests.post(f"{url_lock}/{handle}", headers=headers)
-    response.raise_for_status()
-except:
-    print("ABORTING: router not available for update")
-    sys.exit(200)
-    
+    try:
+        response = requests.post(f"{URL_LOCK}/{handle}", headers=headers)
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        logger.error("ABORTING: router not available for update")
+        logger.error(f"Message - {e}")
+        sys.exit(200)
+
+
 # Get the config from the IXP Manager
-if debug:
-	print(f"GET {url_conf}/{handle} with API key {api_key}")
-    
-try:
-    response = requests.get(f"{url_conf}/{handle}", headers=headers)
-    response.raise_for_status()
-    
-    with open(dest, "w") as file:
-        file.write(response.text)
+def get_config(debug, handle, dest, headers, logger):
+    if debug:
+        logger.debug(f"GET {URL_CONF}/{handle} with API key {API_KEY}")
 
-except:
-    print(f"ERROR: non-zero return from curl when generating {dest}")
-    sys.exit()
+    try:
+        response = requests.get(f"{URL_CONF}/{handle}", headers=headers)
+        response.raise_for_status()
+
+        with open(dest, "w") as file:
+            file.write(response.text)
+
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"Non-zero return from curl when generating {dest}")
+        logger.error(f"Message - {e}")
+        sys.exit()
+
+    except IOError as e:
+        logger.error(f"Could not write to {dest}")
+        logger.error(f"Message - {e}")
+        sys.exit()
+
 
 # Check if the generated file is valid
-if not os.path.exists(dest) or not os.path.getsize(dest):
-    print(f"ERROR: {dest} does not exist or is zero size")
-    sys.exit(3)
-    
-with open(dest, "r") as file:
-    contents = file.read()
-    bgp_count = contents.count("protocol bgp pb_")
-    if bgp_count < 2:
-        print(f"ERROR: fewer than 2 BGP protocol definitions in config file {dest} - something has gone wrong...")
-        sys.exit(4)
+def is_valid_file(dest, logger):
+    if not os.path.exists(dest) or not os.path.getsize(dest):
+        logger.error(f"{dest} does not exist or is zero size")
+        sys.exit(3)
+
+    with open(dest, "r") as file:
+        contents = file.read()
+        bgp_count = contents.count("protocol bgp pb_")
+        if bgp_count < 2:
+            logger.error(
+                f"Fewer than 2 BGP protocol definitions in config file {dest} - something has gone wrong..."
+            )
+            sys.exit(4)
+
 
 # Parse and check the config file
-def parse_config():
-    command = f"{bird_bin} -p -c {dest}"
+def parse_config(debug, dest, logger):
+    command = f"{BIRD_BIN} -p -c {dest}"
     if debug:
-        print(f"Checking config file {dest} for errors")
+        logger.debug(f"Checking config file {dest} for errors")
     try:
-        result = subprocess.run(command, check=True, capture_output=True, shell=True)
-    except:
-        print(f"ERROR: non-zero return from {bird_bin} when parsing {dest}")
+        subprocess.run(command, check=True, capture_output=True, shell=True)
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Non-zero return from {BIRD_BIN} when parsing {dest}")
+        logger.error(f"Message - {e}")
         sys.exit(7)
 
-parse_config()
-# Config file is valid if this point is reached
 
-# Apply config and start Bird if needed
-
-reload_required = 1
-
+# Apply config and start Bird if neededj
 # Filter out the comments from the given file
 def filter_comments(file_path):
-    filtered_lines = []
+    filtered_file = ""
     with open(file_path, "r") as file:
         lines = file.readlines()
         for line in lines:
             if not line.strip()[0]:
-                filtered_lines.append(line)
-        return filtered_lines
-    
-if os.path.exists(cfile):
-    cfile_filtered = filter_comments(cfile)
-    dest_filtered = filter_comments(dest)
-    if cfile_filtered == dest_filtered:
-        print("No changes detected")
-        reload_required = 0
-        os.remove(dest)
+                filtered_file += line
+        return filtered_file
+
+
+# USE HASH INSTEAD OF COMPARING LINES ITS QUICKER
+def detect_change(cfile, dest, logger):
+    if os.path.exists(cfile):
+        cfile_filtered = filter_comments(cfile)
+        dest_filtered = filter_comments(dest)
+
+        hash = hashlib.sha256()
+        hash.update(cfile_filtered)
+        cfile_hash = hash.hexdigest()
+        hash.update(dest_filtered)
+        dest_hash = hash.hexdigest()
+
+        if cfile_hash == dest_hash:
+            logger.info("No changes detected")
+            os.remove(dest)
+            return 0
+        else:
+            os.copyfile(cfile, f"{cfile}.old")
+            os.rename(dest, cfile)
+            return 1
     else:
-        os.copyfile(cfile, f"{cfile}.old")
         os.rename(dest, cfile)
-else:
-    os.rename(dest, cfile)
-    
-if force_reload == 1:
-    reload_required = 1
+        return 1
+
 
 # Does the Bird daemon need to be started
-if debug:
-    print(f"Show memory usage of each instance of {bird_bin}")
-
-
 # Couldn't find a pythonic way to do this, so using subprocess
-
-
-command = f"{bird_bin}c -s {socket} show status"
-result = subprocess.run(command, capture_output=True, shell=True)
-    
-if debug:
-	print(command)
-
-# Unsuccsful command run
-if result.returncode != 0:
-	command = f"{bird_bin} -c {cfile} -s {socket}"
-	if debug:
-		print(command)
-	try:
-		subprocess.run(command, check=True, shell=True)
-	except:
-		print(f"ERROR: could not start {bird_bin} daemon with command: {command}")
-		sys.exit(5)
-
-# Successful command run
-elif reload_required:
-    try:
-        command = f"{bird_bin}c -s {socket} configure"
+def revert_config(dest, cfile, socket, debug, logger):
+    if os.path.exists(f"{cfile}.old"):
+        logger.info("Trying to revert to previous")
+        os.move(f"{cfile}.conf", f"{dest}.failed")
+        os.move(f"{cfile}.old", cfile)
+        command = f"{BIRD_BIN}c -s {socket} configure"
         if debug:
-            print(command)
-        subprocess.run(command, check=True, shell=True)
-    
-	# Try to revert to the previous config
-    except:
-        print(f"ERROR: Reconfigure failed for {dest}")
-        if os.path.exists(f"{cfile}.old"):
-            print("Trying to revert to previous")
-            os.move(f"{cfile}.conf", f"{dest}.failed")
-            os.move(f"{cfile}.old", cfile)
-            command = f"{bird_bin}c -s {socket} configure"
-            if debug:
-                print(command)
-            try:
-                subprocess.run(command, check=True, shell=True)
-                print("Successfully reverted")
-            except:
-                print("ERROR: Revert failed")
-                sys.exit(6)
+            logger.debug(command)
+        try:
+            subprocess.run(command, check=True, shell=True)
+            logger.info("Successfully reverted")
+        except subprocess.CalledProcessError as e:
+            logger.error("Revert failed due to subprocess error")
+            logger.error(f"Message - {e}")
+            sys.exit(6)
+        except IOError as e:
+            logger.error("Rever failed due to IO error")
+            logger.error(f"Message - {e}")
+            sys.exit(6)
 
-elif debug:
-    print("Bird running and no reload required so skipping configure")    
+
+def reload_if_needed(socket, cfile, reload_required, debug, dest, logger):
+    command = f"{BIRD_BIN}c -s {socket} show status"
+    result = subprocess.run(command, capture_output=True, shell=True)
+
+    if debug:
+        logger.debug(command)
+
+    # Unsuccesful command run
+    if result.returncode != 0:
+        command = f"{BIRD_BIN} -c {cfile} -s {socket}"
+        if debug:
+            logger.debug(command)
+        try:
+            subprocess.run(command, check=True, shell=True)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Could not start {BIRD_BIN} daemon with command: {command}")
+            logger.error(f"Message - {e}")
+            sys.exit(5)
+
+    # Successful command run
+    elif reload_required:
+        try:
+            command = f"{BIRD_BIN}c -s {socket} configure"
+            if debug:
+                logger.info(command)
+            subprocess.run(command, check=True, shell=True)
+
+        # Try to revert to the previous config
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Reconfigure failed for {dest}")
+            logger.error(f"Message - {e}")
+            revert_config(dest, cfile, socket, debug, logger)
+
+    elif debug:
+        logger.debug("Bird running and no reload required so skipping configure")
 
 
 # Tell IXP manager that the router has been updated
-if debug:
-    print(f"POST {url_done}/{handle} with API key {api_key}")
+def inform_ixp_manager(debug, handle, headers, logger):
+    if debug:
+        logger.debug(f"POST {URL_DONE}/{handle} with API key {API_KEY}")
 
-inform_success = False
-while not inform_success:
-    try:
-        response = requests.post(f"{url_done}/{handle}", headers=headers)
-        response.raise_for_status()
-        inform_success = True
-    except:
-        print(f"Warning - could not inform IXP Manager of update for {handle}, retrying in 60 seconds")
-        time.sleep(60)
+    inform_success = False
+    while not inform_success:
+        try:
+            response = requests.post(f"{URL_DONE}/{handle}", headers=headers)
+            response.raise_for_status()
+            inform_success = True
+        except requests.exceptions.HTTPError as e:
+            logger.error(
+                f"Could not inform IXP Manager of update for {handle}, retrying in 60 seconds"
+            )
+            logger.error(f"Message - {e}")
+            time.sleep(60)
 
-sys.exit(0)
 
+def main():
+    logger = logging.getLogger(__name__)
+    logging.basicConfig(level=logging.INFO)
+    debug = 0
+    force_reload = 0
+
+    # Check if the script is run with any arguments
+    args = parse_args()
+    if args.debug:
+        debug = 1
+        logging.basicConfig(level=logging.DEBUG)
+    if args.force:
+        force_reload = 1
+    if args.handle:
+        handle = args.handle
+    else:
+        logger.error("Handle is required")
+        sys.exit(1)
+
+    create_directories(logger)
+    cfile = f"{ETC_PATH}/bird-{handle}.conf"
+    dest = f"{cfile}.$$"
+    socket = f"{RUN_PATH}/bird-{handle}.ctl"
+
+    # Prevent multiple instances of the script running at the same time
+    lock = f"{LOCK_PATH}/{handle}.lock"
+    create_lock(lock, handle, logger)
+
+    headers = {"X-IXP-Manager-API-Key": API_KEY}
+    get_lock(handle, headers, debug, logger)
+
+    get_config(debug, handle, dest, headers, logger)
+    is_valid_file(dest, logger)
+    parse_config(debug, dest, logger)
+
+    # Config file is valid if this point is reached
+    reload_required = detect_change(cfile, dest, logger)
+    if force_reload:
+        reload_required = 1
+    if debug:
+        logger.debug(f"Show memory usage of each instance of {BIRD_BIN}")
+
+    reload_if_needed(socket, cfile, reload_required, debug, dest, logger)
+    # Inform IXP Manager that the router has been updated and release the lock
+    inform_ixp_manager(debug, handle, headers, logger)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
