@@ -29,30 +29,17 @@ import subprocess
 import time
 import logging
 import hashlib
+from dotenv import load_dotenv
 
-# You need to set specific IXP Manager installation details
-# You should only need to edit the first 3 lines
-API_KEY = "your-api-key"
-URL_ROOT = "https://ixp.example.com"
-BIRD_BIN = "/usr/sbin/bird"
+load_dotenv()
 
-# Following code should be fine on a typical Debian/Ubuntu system
-URL_LOCK = f"{URL_ROOT}/api/v4/router/get-update-lock"
-URL_CONF = f"{URL_ROOT}/api/v4/router/gen-config"
-URL_DONE = f"{URL_ROOT}/api/v4/router/updated"
-
-ETC_PATH = "/usr/local/etc/bird"
-RUN_PATH = "/var/run/bird"
-LOG_PATH = "/var/log/bird"
-LOCK_PATH = "/tmp/ixp-manager-locks"
-
-SLACK_URL = (
-    "https://hooks.slack.com/services/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"
-)
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+debug = 0
 
 
 # Exit with an error code and send the error to Slack
-def error_exit(code, error, logger, handle):
+def error_exit(code, error, handle):
     logger.error(f"Message - {error}")
     host = os.gethostname()
     if SLACK_URL:
@@ -64,6 +51,30 @@ def error_exit(code, error, logger, handle):
         )
 
     sys.exit(code)
+
+
+# You need to set specific IXP Manager installation details
+# You should only need to edit the first 3 lines
+try:
+    API_KEY = os.environ.get("API_KEY")
+    URL_ROOT = os.environ.get("URL_ROOT")
+    BIRD_BIN = os.environ.get("BIRD_BIN")
+
+    # Following code should be fine on a typical Debian/Ubuntu system
+    URL_LOCK = f"{URL_ROOT}/api/v4/router/get-update-lock"
+    URL_CONF = f"{URL_ROOT}/api/v4/router/gen-config"
+    URL_DONE = f"{URL_ROOT}/api/v4/router/updated"
+
+    ETC_PATH = os.environ.get("ETC_PATH")
+    RUN_PATH = os.environ.get("RUN_PATH")
+    LOG_PATH = os.environ.get("LOG_PATH")
+    LOCK_PATH = os.environ.get("LOCK_PATH")
+
+    SLACK_URL = os.environ.get("SLACK_URL")
+
+except Exception as e:
+    logger.error("Environment variables not set correctly")
+    error_exit(1, f"Environment variable error: {e}", "None set")
 
 
 # Parse command line arguments
@@ -78,7 +89,7 @@ def parse_args():
 
 
 # Create necessary directories for Bird
-def create_directories(logger):
+def create_directories():
     try:
         os.makedirs(ETC_PATH, exist_ok=True)
         os.makedirs(LOG_PATH, exist_ok=True)
@@ -96,7 +107,7 @@ def remove_lock(lock):
         os.remove(lock)
 
 
-def create_lock(lock, handle, logger):
+def create_lock(lock, handle):
     if os.path.exists(lock):
         logger.info(
             f"There is another instance running for {handle} and locked via {lock}, exiting"
@@ -110,7 +121,7 @@ def create_lock(lock, handle, logger):
 
 
 # Get a lock from IXP Manager to update the router
-def get_lock(handle, headers, debug, logger):
+def get_lock(handle, headers):
     if debug:
         logger.debug(f"POST {URL_LOCK}/{handle} with API key {API_KEY}")
 
@@ -124,7 +135,7 @@ def get_lock(handle, headers, debug, logger):
 
 
 # Get the config from the IXP Manager
-def get_config(debug, handle, dest, headers, logger):
+def get_config(handle, dest, headers):
     if debug:
         logger.debug(f"GET {URL_CONF}/{handle} with API key {API_KEY}")
 
@@ -147,7 +158,7 @@ def get_config(debug, handle, dest, headers, logger):
 
 
 # Check if the generated file is valid
-def is_valid_file(dest, logger):
+def is_valid_file(dest):
     if not os.path.exists(dest) or not os.path.getsize(dest):
         logger.error(f"{dest} does not exist or is zero size")
         sys.exit(3)
@@ -163,7 +174,7 @@ def is_valid_file(dest, logger):
 
 
 # Parse and check the config file
-def parse_config(debug, dest, logger):
+def parse_config(dest):
     command = f"{BIRD_BIN} -p -c {dest}"
     if debug:
         logger.debug(f"Checking config file {dest} for errors")
@@ -188,7 +199,7 @@ def filter_comments(file_path):
 
 
 # USE HASH INSTEAD OF COMPARING LINES ITS QUICKER
-def detect_change(cfile, dest, logger):
+def detect_change(cfile, dest):
     if os.path.exists(cfile):
         cfile_filtered = filter_comments(cfile)
         dest_filtered = filter_comments(dest)
@@ -214,7 +225,7 @@ def detect_change(cfile, dest, logger):
 
 # Does the Bird daemon need to be started
 # Couldn't find a pythonic way to do this, so using subprocess
-def revert_config(dest, cfile, socket, debug, logger):
+def revert_config(dest, cfile, socket):
     if os.path.exists(f"{cfile}.old"):
         logger.info("Trying to revert to previous")
         os.move(f"{cfile}.conf", f"{dest}.failed")
@@ -235,7 +246,7 @@ def revert_config(dest, cfile, socket, debug, logger):
             sys.exit(6)
 
 
-def reload_if_needed(socket, cfile, reload_required, debug, dest, logger):
+def reload_if_needed(socket, cfile, reload_required, dest):
     command = f"{BIRD_BIN}c -s {socket} show status"
     result = subprocess.run(command, capture_output=True, shell=True)
 
@@ -273,7 +284,7 @@ def reload_if_needed(socket, cfile, reload_required, debug, dest, logger):
 
 
 # Tell IXP manager that the router has been updated
-def inform_ixp_manager(debug, handle, headers, logger):
+def inform_ixp_manager(handle, headers):
     if debug:
         logger.debug(f"POST {URL_DONE}/{handle} with API key {API_KEY}")
 
@@ -292,9 +303,7 @@ def inform_ixp_manager(debug, handle, headers, logger):
 
 
 def main():
-    logger = logging.getLogger(__name__)
-    logging.basicConfig(level=logging.INFO)
-    debug = 0
+    global debug  # As debug is modified in the main function
     force_reload = 0
 
     # Check if the script is run with any arguments
@@ -310,32 +319,32 @@ def main():
         logger.error("Handle is required")
         sys.exit(1)
 
-    create_directories(logger)
+    create_directories()
     cfile = f"{ETC_PATH}/bird-{handle}.conf"
     dest = f"{cfile}.$$"
     socket = f"{RUN_PATH}/bird-{handle}.ctl"
 
     # Prevent multiple instances of the script running at the same time
     lock = f"{LOCK_PATH}/{handle}.lock"
-    create_lock(lock, handle, logger)
+    create_lock(lock, handle)
 
     headers = {"X-IXP-Manager-API-Key": API_KEY}
-    get_lock(handle, headers, debug, logger)
+    get_lock(handle, headers)
 
-    get_config(debug, handle, dest, headers, logger)
-    is_valid_file(dest, logger)
-    parse_config(debug, dest, logger)
+    get_config(handle, dest, headers)
+    is_valid_file(dest)
+    parse_config(dest)
 
     # Config file is valid if this point is reached
-    reload_required = detect_change(cfile, dest, logger)
+    reload_required = detect_change(cfile, dest)
     if force_reload:
         reload_required = 1
     if debug:
         logger.debug(f"Show memory usage of each instance of {BIRD_BIN}")
 
-    reload_if_needed(socket, cfile, reload_required, debug, dest, logger)
+    reload_if_needed(socket, cfile, reload_required, dest)
     # Inform IXP Manager that the router has been updated and release the lock
-    inform_ixp_manager(debug, handle, headers, logger)
+    inform_ixp_manager(handle, headers)
     sys.exit(0)
 
 
