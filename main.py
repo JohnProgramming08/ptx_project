@@ -41,7 +41,7 @@ logging.basicConfig(level=logging.INFO)
 # Exit with an error code and send the error to Slack
 def error_exit(code, error, handle):
     logger.error(f"Message - {error}")
-    host = os.gethostname()
+    host = os.uname()[1]
     if SLACK_URL:
         requests.post(
             SLACK_URL,
@@ -70,7 +70,7 @@ try:
     LOG_PATH = os.environ["LOG_PATH"]
     LOCK_PATH = os.environ["LOCK_PATH"]
 
-    SLACK_URL = os.environ.get["SLACK_URL"]
+    SLACK_URL = os.environ["SLACK_URL"]
 
 except KeyError as e:
     logger.error("Environment variables not set correctly")
@@ -116,7 +116,7 @@ def create_lock(lock, handle):
         process_id = os.getpid()
         with open(lock, "w") as file:
             file.write(str(process_id))
-        atexit.register(remove_lock(lock))
+        atexit.register(remove_lock, lock)
 
 
 # Get a lock from IXP Manager to update the router
@@ -257,7 +257,7 @@ def reload_if_needed(socket, cfile, reload_required, dest, handle):
 
         # Try to revert to the previous config
         except subprocess.CalledProcessError as e:
-            revert_config(dest, cfile, socket)
+            revert_config(dest, cfile, socket, handle)
             logger.error(f"Reconfigure failed for {dest}")
             error_exit(6, e, handle)
 
@@ -306,8 +306,8 @@ def main():
     get_lock(handle, headers)
 
     get_config(handle, dest, headers)
-    is_valid_file(dest)
-    parse_config(dest)
+    is_valid_file(dest, handle)
+    parse_config(dest, handle)
 
     # Config file is valid if this point is reached
     reload_required = detect_change(cfile, dest)
@@ -315,7 +315,7 @@ def main():
         reload_required = 1
     logger.debug(f"Show memory usage of each instance of {BIRD_BIN}")
 
-    reload_if_needed(socket, cfile, reload_required, dest)
+    reload_if_needed(socket, cfile, reload_required, dest, handle)
     # Inform IXP Manager that the router has been updated and release the lock
     inform_ixp_manager(handle, headers)
     sys.exit(0)
